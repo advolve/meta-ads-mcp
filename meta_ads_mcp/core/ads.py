@@ -1362,3 +1362,231 @@ async def get_account_pages(access_token: str = None, account_id: str = None) ->
             "error": "Failed to get account pages",
             "details": str(e)
         }, indent=2)
+
+@mcp_server.tool()
+@meta_api_tool
+async def upload_ad_video(
+    access_token: str,
+    account_id: str,
+    video_path: str,
+    name: Optional[str] = None,
+    description: Optional[str] = None
+) -> str:
+    """
+    Upload a video file to Meta Ads account for use in video creatives.
+
+    Args:
+        access_token (str): Meta API access token
+        account_id (str): Meta Ads account ID (format: act_XXXXXXXXX)
+        video_path (str): Path to local video file (MP4/MOV)
+        name (str, optional): Optional name for the video
+        description (str, optional): Optional video description
+
+    Returns:
+        JSON response with video_id and status
+    """
+    import aiohttp
+
+    if not os.path.exists(video_path):
+        return json.dumps({"error": f"Video file not found: {video_path}"}, indent=2)
+
+    if not account_id.startswith("act_"):
+        account_id = f"act_{account_id}"
+
+    url = f"https://graph-video.facebook.com/v18.0/{account_id}/advideos"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            with open(video_path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("source", f, filename=os.path.basename(video_path))
+                if name:
+                    data.add_field("name", name)
+                if description:
+                    data.add_field("description", description)
+                data.add_field("access_token", access_token)
+
+                async with session.post(url, data=data) as resp:
+                    resp_json = await resp.json()
+                    return json.dumps(resp_json, indent=2)
+    except Exception as e:
+        return json.dumps({"error": "Video upload failed", "details": str(e)}, indent=2)
+
+@mcp_server.tool()
+@meta_api_tool
+async def create_ad_creative_from_video(
+    access_token: str,
+    account_id: str,
+    page_id: str,
+    video_id: str,
+    name: Optional[str] = None,
+    message: Optional[str] = None,
+    call_to_action_type: Optional[str] = "LEARN_MORE",
+    link_url: Optional[str] = None
+) -> str:
+    """
+    Create a video ad creative using a previously uploaded video.
+
+    Args:
+        access_token: Meta API token
+        account_id: Ad account ID (e.g., act_123...)
+        page_id: Facebook Page ID that sponsors the ad
+        video_id: ID returned from video upload
+        name: Optional creative name
+        message: Optional text to appear above the video
+        call_to_action_type: CTA type (e.g., LEARN_MORE, SHOP_NOW)
+        link_url: Destination URL for CTA
+
+    Returns:
+        JSON response with creative_id and details
+    """
+    if not account_id.startswith("act_"):
+        account_id = f"act_{account_id}"
+
+    endpoint = f"{account_id}/adcreatives"
+
+    payload = {
+        "name": name or "Video Creative",
+        "object_story_spec": {
+            "page_id": page_id,
+            "video_data": {
+                "video_id": video_id,
+                "message": message or "Check this out!",
+                "call_to_action": {
+                    "type": call_to_action_type,
+                    "value": {
+                        "link": link_url or "https://example.com"
+                    }
+                }
+            }
+        }
+    }
+
+    result = await make_api_request(endpoint, access_token, payload, method="POST")
+    return json.dumps(result, indent=2)
+
+@mcp_server.tool()
+@meta_api_tool
+async def create_ad_from_creative(
+    access_token: str,
+    account_id: str,
+    adset_id: str,
+    creative_id: str,
+    name: Optional[str] = None,
+    status: Optional[str] = "PAUSED"
+) -> str:
+    """
+    Create an ad from an existing creative.
+
+    Args:
+        access_token: Meta API token
+        account_id: Ad account ID (e.g., act_123...)
+        adset_id: ID of the ad set to attach this ad to
+        creative_id: ID of the creative (e.g., from image or video)
+        name: Ad name
+        status: Ad status (PAUSED, ACTIVE, etc.)
+
+    Returns:
+        JSON response with ad_id and details
+    """
+    if not account_id.startswith("act_"):
+        account_id = f"act_{account_id}"
+
+    endpoint = f"{account_id}/ads"
+
+    payload = {
+        "name": name or "Ad from creative",
+        "adset_id": adset_id,
+        "creative": {"creative_id": creative_id},
+        "status": status
+    }
+
+    result = await make_api_request(endpoint, access_token, payload, method="POST")
+    return json.dumps(result, indent=2)
+
+@mcp_server.tool()
+@meta_api_tool
+async def create_ad_from_video_file(
+    access_token: str,
+    account_id: str,
+    adset_id: str,
+    page_id: str,
+    video_path: str,
+    ad_name: Optional[str] = None,
+    creative_name: Optional[str] = None,
+    message: Optional[str] = None,
+    call_to_action_type: Optional[str] = "LEARN_MORE",
+    link_url: Optional[str] = None,
+    status: Optional[str] = "PAUSED"
+) -> str:
+    """
+    Create a complete video ad (video upload → creative → ad) in one step.
+
+    Args:
+        access_token: Meta API token
+        account_id: Ad account ID (e.g., act_123...)
+        adset_id: Ad set ID to associate the ad
+        page_id: Facebook Page ID sponsoring the ad
+        video_path: Local path to video (MP4/MOV)
+        ad_name: Name for the ad (optional)
+        creative_name: Name for the creative (optional)
+        message: Text above the video (optional)
+        call_to_action_type: CTA type (e.g., LEARN_MORE, SHOP_NOW)
+        link_url: URL for the CTA
+        status: Initial status of the ad (PAUSED/ACTIVE)
+
+    Returns:
+        JSON response with ad_id, creative_id, and video_id
+    """
+    if not os.path.exists(video_path):
+        return json.dumps({"error": f"Video file not found: {video_path}"}, indent=2)
+
+    video_result = await upload_ad_video(
+        access_token=access_token,
+        account_id=account_id,
+        video_path=video_path,
+        name=creative_name,
+        description=message,
+    )
+
+    video_data = json.loads(video_result)
+    if "id" not in video_data:
+        return json.dumps({"error": "Video upload failed", "details": video_data}, indent=2)
+
+    video_id = video_data["id"]
+
+    creative_result = await create_ad_creative_from_video(
+        access_token=access_token,
+        account_id=account_id,
+        page_id=page_id,
+        video_id=video_id,
+        name=creative_name,
+        message=message,
+        call_to_action_type=call_to_action_type,
+        link_url=link_url,
+    )
+
+    creative_data = json.loads(creative_result)
+    if "id" not in creative_data:
+        return json.dumps({"error": "Creative creation failed", "details": creative_data}, indent=2)
+
+    creative_id = creative_data["id"]
+
+    ad_result = await create_ad_from_creative(
+        access_token=access_token,
+        account_id=account_id,
+        adset_id=adset_id,
+        creative_id=creative_id,
+        name=ad_name,
+        status=status,
+    )
+
+    ad_data = json.loads(ad_result)
+    if "id" not in ad_data:
+        return json.dumps({"error": "Ad creation failed", "details": ad_data}, indent=2)
+
+    return json.dumps({
+        "video_id": video_id,
+        "creative_id": creative_id,
+        "ad_id": ad_data["id"]
+    }, indent=2)
