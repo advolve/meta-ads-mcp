@@ -562,66 +562,83 @@ async def update_ad(
 @mcp_server.tool()
 @meta_api_tool
 async def upload_ad_image(
-    access_token: str = None,
-    account_id: str = None,
-    image_path: str = None,
-    name: str = None
+        access_token: str = None,
+        account_id: str = None,
+        image_path: str = None,
+        name: str = None,
+        ad_image_crops: Optional[Dict[str, List[List[int]]]] = None,
 ) -> str:
     """
     Upload an image to use in Meta Ads creatives.
-    
+
     Args:
         access_token: Meta API access token (optional - will use cached token if not provided)
         account_id: Meta Ads account ID (format: act_XXXXXXXXX)
         image_path: Path to the image file to upload
         name: Optional name for the image (default: filename)
-    
+        ad_image_crops (dict, optional): Optional crop map in the format:
+            {
+                "100x100": [[0, 0, 100, 100]],
+                "191x100": [[12, 0, 204, 100]]
+            }
+
     Returns:
         JSON response with image details including hash for creative creation
     """
     # Check required parameters
     if not account_id:
         return json.dumps({"error": "No account ID provided"}, indent=2)
-    
+
     if not image_path:
         return json.dumps({"error": "No image path provided"}, indent=2)
-    
+
     # Ensure account_id has the 'act_' prefix for API compatibility
     if not account_id.startswith("act_"):
         account_id = f"act_{account_id}"
-    
+
     # Check if image file exists
     if not os.path.exists(image_path):
         return json.dumps({"error": f"Image file not found: {image_path}"}, indent=2)
-    
+
     try:
         # Read image file
         with open(image_path, "rb") as img_file:
             image_bytes = img_file.read()
-        
+
         # Get image filename if name not provided
         if not name:
             name = os.path.basename(image_path)
-        
+
         # Prepare the API endpoint for uploading images
         endpoint = f"{account_id}/adimages"
-        
+
         # We need to convert the binary data to base64 for API upload
         import base64
         encoded_image = base64.b64encode(image_bytes).decode('utf-8')
-        
+
         # Prepare POST parameters
         params = {
             "bytes": encoded_image,
             "name": name
         }
-        
+
+        if ad_image_crops:
+            if not isinstance(ad_image_crops, dict):
+                return json.dumps({"error": "Invalid format: ad_image_crops must be a dictionary"}, indent=2)
+            try:
+                for key, val in ad_image_crops.items():
+                    if not isinstance(key, str) or not isinstance(val, list):
+                        raise ValueError
+                params["ad_image_crops"] = json.dumps(ad_image_crops)
+            except (TypeError, ValueError):
+                return json.dumps({"error": "Invalid ad_image_crops structure"}, indent=2)
+
         # Make API request to upload the image
         print(f"Uploading image to Facebook Ad Account {account_id}")
         data = await make_api_request(endpoint, access_token, params, method="POST")
-        
+
         return json.dumps(data, indent=2)
-    
+
     except Exception as e:
         return json.dumps({
             "error": "Failed to upload image",
@@ -1422,7 +1439,8 @@ async def create_ad_creative_from_video(
     name: Optional[str] = None,
     message: Optional[str] = None,
     call_to_action_type: Optional[str] = "LEARN_MORE",
-    link_url: Optional[str] = None
+    link_url: Optional[str] = None,
+    image_hash: Optional[str] = None
 ) -> str:
     """
     Create a video ad creative using a previously uploaded video.
@@ -1436,12 +1454,18 @@ async def create_ad_creative_from_video(
         message: Optional text to appear above the video
         call_to_action_type: CTA type (e.g., LEARN_MORE, SHOP_NOW)
         link_url: Destination URL for CTA
+        image_hash: Required thumbnail image hash for the video
 
     Returns:
         JSON response with creative_id and details
     """
     if not account_id.startswith("act_"):
         account_id = f"act_{account_id}"
+
+    if not image_hash:
+        return json.dumps({
+            "error": "Missing image_hash. Meta Ads requires a video thumbnail for all video creatives."
+        }, indent=2)
 
     endpoint = f"{account_id}/adcreatives"
 
@@ -1457,13 +1481,15 @@ async def create_ad_creative_from_video(
                     "value": {
                         "link": link_url or "https://example.com"
                     }
-                }
+                },
+                "image_hash": image_hash
             }
         }
     }
 
     result = await make_api_request(endpoint, access_token, payload, method="POST")
     return json.dumps(result, indent=2)
+
 
 @mcp_server.tool()
 @meta_api_tool
@@ -1517,7 +1543,8 @@ async def create_ad_from_video_file(
     message: Optional[str] = None,
     call_to_action_type: Optional[str] = "LEARN_MORE",
     link_url: Optional[str] = None,
-    status: Optional[str] = "PAUSED"
+    status: Optional[str] = "PAUSED",
+    image_hash: Optional[str] = None
 ) -> str:
     """
     Create a complete video ad (video upload → creative → ad) in one step.
@@ -1564,6 +1591,7 @@ async def create_ad_from_video_file(
         message=message,
         call_to_action_type=call_to_action_type,
         link_url=link_url,
+        image_hash=image_hash
     )
 
     creative_data = json.loads(creative_result)
@@ -1590,3 +1618,66 @@ async def create_ad_from_video_file(
         "creative_id": creative_id,
         "ad_id": ad_data["id"]
     }, indent=2)
+
+@mcp_server.tool()
+@meta_api_tool
+async def upload_multiple_ad_images(
+    access_token: str,
+    account_id: str,
+    images: List[Dict[str, Optional[str]]],
+) -> str:
+    """
+    Upload multiple images to Meta Ads account using MCP.
+
+    Each image dict must contain:
+      - image_path: Local file path
+      - name: Optional image name
+      - ad_image_crops: Optional crop dictionary
+
+    Example input:
+    images=[
+      {
+        "image_path": "/tmp/img1.jpg",
+        "name": "creative1",
+        "ad_image_crops": {"1000x1000": [[0, 0, 1000, 1000]]}
+      },
+      {
+        "image_path": "/tmp/img2.jpg",
+        "name": "creative2"
+      }
+    ]
+
+    Returns:
+        JSON string with list of results per image
+    """
+
+    if not access_token or not account_id:
+        return json.dumps({"error": "Missing access_token or account_id"}, indent=2)
+
+    if not images:
+        return json.dumps({"error": "No images provided"}, indent=2)
+
+    if not account_id.startswith("act_"):
+        account_id = f"act_{account_id}"
+
+    results = []
+    for i, img in enumerate(images):
+        image_path = img.get("image_path")
+        name = img.get("name")
+        ad_image_crops = img.get("ad_image_crops")
+
+        if not image_path or not os.path.exists(image_path):
+            results.append({"index": i, "error": f"File not found: {image_path}"})
+            continue
+
+        result = await upload_ad_image(
+            access_token=access_token,
+            account_id=account_id,
+            image_path=image_path,
+            name=name,
+            ad_image_crops=ad_image_crops,
+        )
+
+        results.append(json.loads(result))
+
+    return json.dumps(results, indent=2)
