@@ -90,8 +90,8 @@ async def get_adset_details(access_token: str = None, adset_id: str = None) -> s
 @mcp_server.tool()
 @meta_api_tool
 async def create_adset(
-    account_id: str = None, 
-    campaign_id: str = None, 
+    account_id: str = None,
+    campaign_id: str = None,
     name: str = None,
     status: str = "PAUSED",
     daily_budget = None,
@@ -104,11 +104,21 @@ async def create_adset(
     start_time: str = None,
     end_time: str = None,
     dsa_beneficiary: str = None,
+    promoted_object: Dict[str, Any] = None,
+    destination_type: str = None,
+    pacing_type: List[str] = None,
+    time_based_ad_rotation_id_blocks: List[List[str]] = None,
+    time_based_ad_rotation_intervals: List[int] = None,
+    campaign_attribution: Dict[str, Any] = None,
+    optimization_sub_event: str = None,
+    attribution_spec: List[Dict[str, str]] = None,
+    execution_options: List[str] = None,
+    bid_constraints: Dict[str, Any] = None,
     access_token: str = None
 ) -> str:
     """
     Create a new ad set in a Meta Ads account.
-    
+
     Args:
         account_id: Meta Ads account ID (format: act_XXXXXXXXX)
         campaign_id: Meta Ads campaign ID this ad set belongs to
@@ -117,33 +127,72 @@ async def create_adset(
         daily_budget: Daily budget in account currency (in cents) as a string
         lifetime_budget: Lifetime budget in account currency (in cents) as a string
         targeting: Targeting specifications including age, location, interests, etc.
-                  Use targeting_automation.advantage_audience=1 for automatic audience finding
-        optimization_goal: Conversion optimization goal (e.g., 'LINK_CLICKS', 'REACH', 'CONVERSIONS')
+        optimization_goal: Conversion optimization goal (e.g., 'LINK_CLICKS', 'REACH', 'CONVERSIONS', 'APP_INSTALLS')
         billing_event: How you're charged (e.g., 'IMPRESSIONS', 'LINK_CLICKS')
         bid_amount: Bid amount in account currency (in cents)
-        bid_strategy: Bid strategy (e.g., 'LOWEST_COST', 'LOWEST_COST_WITH_BID_CAP')
-        start_time: Start time in ISO 8601 format (e.g., '2023-12-01T12:00:00-0800')
+        bid_strategy: Bid strategy (e.g., 'LOWEST_COST')
+        start_time: Start time in ISO 8601 format
         end_time: End time in ISO 8601 format
-        dsa_beneficiary: DSA beneficiary (person/organization benefiting from ads) for European compliance
-        access_token: Meta API access token (optional - will use cached token if not provided)
+        dsa_beneficiary: Beneficiary for DSA compliance
+        promoted_object: Mobile app parameters, required for APP_INSTALLS
+        destination_type: Where users are directed after clicking the ad
+        pacing_type: List like ['standard'] or ['no_pacing']
+        time_based_ad_rotation_id_blocks: Ad rotation schedule
+        time_based_ad_rotation_intervals: Corresponding intervals
+        campaign_attribution: Map of conversion type to campaign
+        optimization_sub_event: e.g., 'NONE', 'TRIP_CONVERSION'
+        attribution_spec: Attribution windows [{'event_type': 'CLICK_THROUGH', 'window_days': 1}]
+        execution_options: Execution modifiers (e.g., ['validate_only'])
+        bid_constraints: e.g., {'impression': {'bid_amount': 150}}
+        access_token: Meta API token
     """
     # Check required parameters
     if not account_id:
         return json.dumps({"error": "No account ID provided"}, indent=2)
-    
     if not campaign_id:
         return json.dumps({"error": "No campaign ID provided"}, indent=2)
-    
     if not name:
         return json.dumps({"error": "No ad set name provided"}, indent=2)
-    
     if not optimization_goal:
         return json.dumps({"error": "No optimization goal provided"}, indent=2)
-    
     if not billing_event:
         return json.dumps({"error": "No billing event provided"}, indent=2)
-    
-    # Basic targeting is required if not provided
+
+    # Validate APP_INSTALLS campaigns
+    if optimization_goal == "APP_INSTALLS":
+        if not promoted_object:
+            return json.dumps({
+                "error": "promoted_object is required for APP_INSTALLS optimization goal",
+                "details": "Mobile app campaigns must specify which app is being promoted",
+                "required_fields": ["application_id", "object_store_url"]
+            }, indent=2)
+        if not isinstance(promoted_object, dict):
+            return json.dumps({
+                "error": "promoted_object must be a dictionary",
+                "example": {"application_id": "123456789012345", "object_store_url": "https://apps.apple.com/app/id123456789"}
+            }, indent=2)
+        if "application_id" not in promoted_object:
+            return json.dumps({"error": "promoted_object missing required field: application_id"}, indent=2)
+        if "object_store_url" not in promoted_object:
+            return json.dumps({"error": "promoted_object missing required field: object_store_url"}, indent=2)
+        valid_store_patterns = ["apps.apple.com", "play.google.com", "itunes.apple.com"]
+        if not any(p in promoted_object["object_store_url"] for p in valid_store_patterns):
+            return json.dumps({
+                "error": "Invalid object_store_url format",
+                "details": "URL must be from App Store or Google Play",
+                "provided_url": promoted_object["object_store_url"]
+            }, indent=2)
+
+    # Validate destination_type
+    if destination_type:
+        valid_destination_types = ["APP_STORE", "DEEPLINK", "APP_INSTALL", "ON_AD"]
+        if destination_type not in valid_destination_types:
+            return json.dumps({
+                "error": f"Invalid destination_type: {destination_type}",
+                "valid_values": valid_destination_types
+            }, indent=2)
+
+    # Default targeting
     if not targeting:
         targeting = {
             "age_min": 18,
@@ -151,69 +200,74 @@ async def create_adset(
             "geo_locations": {"countries": ["US"]},
             "targeting_automation": {"advantage_audience": 1}
         }
-    
+
     endpoint = f"{account_id}/adsets"
-    
     params = {
         "name": name,
         "campaign_id": campaign_id,
         "status": status,
         "optimization_goal": optimization_goal,
         "billing_event": billing_event,
-        "targeting": json.dumps(targeting)  # Properly format as JSON string
+        "targeting": json.dumps(targeting)
     }
-    
-    # Convert budget values to strings if they aren't already
+
     if daily_budget is not None:
         params["daily_budget"] = str(daily_budget)
-    
     if lifetime_budget is not None:
         params["lifetime_budget"] = str(lifetime_budget)
-    
-    # Add other parameters if provided
     if bid_amount is not None:
         params["bid_amount"] = str(bid_amount)
-    
     if bid_strategy:
         params["bid_strategy"] = bid_strategy
-    
     if start_time:
         params["start_time"] = start_time
-    
     if end_time:
         params["end_time"] = end_time
-    
-    # Add DSA beneficiary if provided
     if dsa_beneficiary:
         params["dsa_beneficiary"] = dsa_beneficiary
-    
+    if promoted_object:
+        params["promoted_object"] = json.dumps(promoted_object)
+    if destination_type:
+        params["destination_type"] = destination_type
+    if pacing_type:
+        params["pacing_type"] = json.dumps(pacing_type)
+    if time_based_ad_rotation_id_blocks:
+        params["time_based_ad_rotation_id_blocks"] = json.dumps(time_based_ad_rotation_id_blocks)
+    if time_based_ad_rotation_intervals:
+        params["time_based_ad_rotation_intervals"] = json.dumps(time_based_ad_rotation_intervals)
+    if campaign_attribution:
+        params["campaign_attribution"] = json.dumps(campaign_attribution)
+    if optimization_sub_event:
+        params["optimization_sub_event"] = optimization_sub_event
+    if attribution_spec:
+        params["attribution_spec"] = json.dumps(attribution_spec)
+    if execution_options:
+        params["execution_options"] = json.dumps(execution_options)
+    if bid_constraints:
+        params["bid_constraints"] = json.dumps(bid_constraints)
+
     try:
         data = await make_api_request(endpoint, access_token, params, method="POST")
         return json.dumps(data, indent=2)
     except Exception as e:
         error_msg = str(e)
-        
-        # Enhanced error handling for DSA beneficiary issues
         if "permission" in error_msg.lower() or "insufficient" in error_msg.lower():
             return json.dumps({
-                "error": "Insufficient permissions to set DSA beneficiary. Please ensure you have business_management permissions.",
+                "error": "Insufficient permissions to set DSA beneficiary.",
                 "details": error_msg,
-                "params_sent": params,
-                "permission_required": True
+                "params_sent": params
             }, indent=2)
-        elif "dsa_beneficiary" in error_msg.lower() and ("not supported" in error_msg.lower() or "parameter" in error_msg.lower()):
+        elif "dsa_beneficiary" in error_msg.lower():
             return json.dumps({
-                "error": "DSA beneficiary parameter not supported in this API version. Please set DSA beneficiary manually in Facebook Ads Manager.",
+                "error": "DSA beneficiary parameter not supported or required.",
                 "details": error_msg,
-                "params_sent": params,
-                "manual_setup_required": True
+                "params_sent": params
             }, indent=2)
-        elif "benefits from ads" in error_msg or "DSA beneficiary" in error_msg:
+        elif "benefits from ads" in error_msg:
             return json.dumps({
-                "error": "DSA beneficiary required for European compliance. Please provide the person or organization that benefits from ads in this ad set.",
+                "error": "DSA beneficiary required for European compliance.",
                 "details": error_msg,
-                "params_sent": params,
-                "dsa_required": True
+                "params_sent": params
             }, indent=2)
         else:
             return json.dumps({
@@ -296,4 +350,32 @@ async def update_adset(adset_id: str, frequency_control_specs: List[Dict[str, An
             "error": f"Failed to update ad set {adset_id}",
             "details": error_msg,
             "params_sent": params
-        }, indent=2) 
+        }, indent=2)
+
+
+@mcp_server.tool()
+@meta_api_tool
+async def get_app_details(
+        app_id: str,
+        access_token: str = None
+) -> str:
+    """
+    Retrieve details for a Meta App (used for ad campaigns).
+
+    Args:
+        app_id: The Facebook App ID to look up.
+        access_token: Access token for the Graph API.
+
+    Returns:
+        App metadata including name, store links, bundle ID, etc.
+    """
+    endpoint = f"{app_id}"
+    params = {
+        "fields": "id,name,linking_uri,ios_bundle_id,android_package_name,app_store_id,website"
+    }
+
+    try:
+        data = await make_api_request(endpoint, access_token, params)
+        return json.dumps(data, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, indent=2)

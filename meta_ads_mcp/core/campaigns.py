@@ -2,14 +2,16 @@
 
 import json
 from typing import List, Optional, Dict, Any, Union
+
 from .api import meta_api_tool, make_api_request
 from .accounts import get_ad_accounts
 from .server import mcp_server
 
 
+
 @mcp_server.tool()
 @meta_api_tool
-async def get_campaigns(access_token: str = None, account_id: str = None, limit: int = 10, status_filter: str = "", after: str = "") -> str:
+async def get_campaigns(access_token: str = None, account_id: str = None, limit: int = 50, status_filter: str = "", after: str = "") -> str:
     """
     Get campaigns for a Meta Ads account with optional filtering.
     
@@ -317,4 +319,4 @@ async def update_campaign(
             "error": f"Failed to update campaign {campaign_id}",
             "details": error_msg,
             "params_sent": params # Be careful about logging sensitive data if any
-        }, indent=2) 
+        }, indent=2)
