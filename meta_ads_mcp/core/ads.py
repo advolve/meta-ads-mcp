@@ -91,49 +91,213 @@ async def get_ad_details(access_token: str = None, ad_id: str = None) -> str:
 @mcp_server.tool()
 @meta_api_tool
 async def create_ad(
-    account_id: str = None,
-    name: str = None,
-    adset_id: str = None,
-    creative_id: str = None,
+    account_id: str | None = None,
+    name: str | None = None,
+    adset_id: str | None = None,
     status: str = "PAUSED",
-    bid_amount = None,
-    tracking_specs: Optional[List[Dict[str, Any]]] = None,
-    access_token: str = None
+
+    creative_id: str | None = None,  # If provided, we will use it as-is
+    # Inline creative builder (ignored if creative_id is set)
+    page_id: str | None = None,                      # Facebook Page identity
+    instagram_actor_id: str | None = None,           # IG identity
+    format: str | None = None,                       # "SINGLE_IMAGE" | "SINGLE_VIDEO" | "CAROUSEL" | "EXISTING_POST"
+    message: str | None = None,                      # Primary text
+    headline: str | None = None,                     # Headline (where applicable)
+    description: str | None = None,                  # Description (where applicable)
+    link_url: str | None = None,                     # Destination URL for link ads
+    call_to_action_type: str | None = None,          # e.g., "LEARN_MORE", "SHOP_NOW", "SIGN_UP"
+    template_url_spec: dict | None = None,           # UTM builder / URL params (API: template_url_spec)
+    image_hash: str | None = None,                   # From /adimages
+    video_id: str | None = None,                     # From /advideos
+    carousel_attachments: list[dict] | None = None,  # [{link, image_hash|video_id, name, description}, ...] (>=2)
+    object_story_id: str | None = None,              # Boost an existing Page/IG post
+    # Deep links to app (API: link_data.app_link_spec)
+    app_link_spec: dict | None = None,               # {"ios":[{app_store_id, url, app_name}], "android":[{package, url, app_name}]}
+    instant_experience_id: str | None = None,        # Attach Instant Experience (Canvas) (API: post_click_configuration.instant_experience_id)
+    partnership_ad_code: str | None = None,          # IG Partnership Ad code (adcode-XXXX) – see notes
+    branded_content_sponsor_page_id: str | None = None,  # Facebook branded content sponsor (non-code flow)
+    sponsor_ig_user_id: str | None = None,               # IG sponsor user (non-code flow)
+    multi_advertiser_enroll_status: str = "OPT_OUT",     # "OPT_OUT" (default) or "OPT_IN"
+    standard_enhancements_enroll_status: str | None = "OPT_OUT",  # avoid “enroll_status not provided” errors
+    bid_amount: int | None = None,                       # Not recommended unless you must override
+    tracking_specs: list[dict] | None = None,            # Legacy; pass-through only
+    creative_overrides: dict | None = None,              # Any raw creative fields to merge last
+    degrees_of_freedom_spec: dict | None = None,         # Pass-through in case API requires it
+    access_token: str | None = None
 ) -> str:
     """
-    Create a new ad with an existing creative.
-    
-    Args:
-        account_id: Meta Ads account ID (format: act_XXXXXXXXX)
-        name: Ad name
-        adset_id: Ad set ID where this ad will be placed
-        creative_id: ID of an existing creative to use
-        status: Initial ad status (default: PAUSED)
-        bid_amount: Optional bid amount in account currency (in cents)
-        tracking_specs: Optional tracking specifications (e.g., for pixel events).
-                      Example: [{"action.type":"offsite_conversion","fb_pixel":["YOUR_PIXEL_ID"]}]
-        access_token: Meta API access token (optional - will use cached token if not provided)
+    Create an Ad under an Ad Set, supporting identity, partnership (ad code),
+    single image / video / carousel formats, deep links, Instant Experience,
+    UTM tagging, and explicit opt-in/out to Multi-advertiser Ads.
+
+    IMPORTANT:
+    - If `creative_id` is provided we will use that creative as-is and ignore inline builder params.
+    - If building inline, you should set `page_id` (FB) and/or `instagram_actor_id` (IG) to define identity.
+    - For CAROUSEL provide `carousel_attachments` with at least 2 items.
+    - For deep links use `app_link_spec`. For Instant Experience provide `instant_experience_id`.
+    - `multi_advertiser_enroll_status` defaults to OPT_OUT to satisfy “default off”; override to OPT_IN if desired.
+    - `tracking_specs` is legacy; in most cases rely on pixel/app/offline events configured at Ad Set / account level.
+
+    Returns:
+        JSON string with API response or structured error.
     """
     # Check required parameters
     if not account_id:
         return json.dumps({"error": "No account ID provided"}, indent=2)
-    
     if not name:
         return json.dumps({"error": "No ad name provided"}, indent=2)
-    
     if not adset_id:
         return json.dumps({"error": "No ad set ID provided"}, indent=2)
+    if creative_id and (format or page_id or instagram_actor_id or image_hash or video_id or carousel_attachments or object_story_id):
+        return json.dumps({"error": "Provide either creative_id OR inline creative params, not both."}, indent=2)
     
-    if not creative_id:
-        return json.dumps({"error": "No creative ID provided"}, indent=2)
-    
+    creative: dict = {}
+    if creative_id:
+        creative = {"creative_id": creative_id}
+    else:
+        # Inline creative requires identity for delivery on most placements.
+        if not (page_id or instagram_actor_id):
+            return json.dumps({
+                "error": "Missing identity for inline creative",
+                "details": "Provide page_id (Facebook) and/or instagram_actor_id (Instagram)."
+            }, indent=2)
+
+        # Normalize format
+        if format not in ( "SINGLE_IMAGE", "SINGLE_VIDEO", "CAROUSEL", "EXISTING_POST" ):
+            return json.dumps({
+                "error": "Invalid or missing 'format'",
+                "valid_values": ["SINGLE_IMAGE", "SINGLE_VIDEO", "CAROUSEL", "EXISTING_POST"]
+            }, indent=2)
+
+        object_story_spec: dict = {}
+        if page_id: object_story_spec["page_id"] = page_id
+        if instagram_actor_id: object_story_spec["instagram_actor_id"] = instagram_actor_id
+
+        # EXISTING_POST / Boost
+        if format == "EXISTING_POST":
+            if not object_story_id:
+                return json.dumps({"error": "object_story_id is required for format=EXISTING_POST"}, indent=2)
+            creative["object_story_id"] = object_story_id
+
+        # SINGLE_IMAGE or CAROUSEL – use link_data
+        if format in ("SINGLE_IMAGE", "CAROUSEL"):
+            if not link_url:
+                return json.dumps({"error": "link_url is required for image/carousel link ads"}, indent=2)
+            link_data: dict = {"link": link_url}
+            if message: link_data["message"] = message
+            if headline: link_data["name"] = headline
+            if description: link_data["description"] = description
+
+            if call_to_action_type:
+                link_data["call_to_action"] = {
+                    "type": call_to_action_type,
+                    "value": {"link": link_url}
+                }
+
+            if template_url_spec:
+                # UTM / URL params: pass-through as provided
+                link_data["template_url_spec"] = template_url_spec
+
+            if app_link_spec:
+                # Deep links into the app (iOS/Android)
+                link_data["app_link_spec"] = app_link_spec
+
+            # Single image needs an image
+            if format == "SINGLE_IMAGE":
+                if not image_hash:
+                    return json.dumps({"error": "image_hash is required for SINGLE_IMAGE"}, indent=2)
+                link_data["image_hash"] = image_hash
+
+            # Carousel: 2+ child attachments with link + media
+            if format == "CAROUSEL":
+                if not carousel_attachments or len(carousel_attachments) < 2:
+                    return json.dumps({"error": "carousel_attachments must contain at least 2 items"}, indent=2)
+                children = []
+                for idx, att in enumerate(carousel_attachments, start=1):
+                    if "link" not in att:
+                        return json.dumps({"error": f"carousel_attachments[{idx}] missing 'link'"}, indent=2)
+                    if not any(k in att for k in ("image_hash", "video_id")):
+                        return json.dumps({"error": f"carousel_attachments[{idx}] needs 'image_hash' or 'video_id'"}, indent=2)
+                    child = {"link": att["link"]}
+                    if "image_hash" in att: child["image_hash"] = att["image_hash"]
+                    if "video_id" in att: child["video_id"] = att["video_id"]
+                    if "name" in att: child["name"] = att["name"]
+                    if "description" in att: child["description"] = att["description"]
+                    if call_to_action_type:
+                        child["call_to_action"] = {"type": call_to_action_type, "value": {"link": att["link"]}}
+                    children.append(child)
+                link_data["child_attachments"] = children
+
+            object_story_spec["link_data"] = link_data
+
+        # SINGLE_VIDEO – use video_data
+        if format == "SINGLE_VIDEO":
+            if not video_id:
+                return json.dumps({"error": "video_id is required for SINGLE_VIDEO"}, indent=2)
+            video_data: dict = {"video_id": video_id}
+            if message: video_data["message"] = message
+            if call_to_action_type and link_url:
+                video_data["call_to_action"] = {"type": call_to_action_type, "value": {"link": link_url}}
+            if link_url:
+                # Some video link ads still use destination link via CTA value.link; keep link_url for clarity
+                video_data["link_description"] = description or ""
+            object_story_spec["video_data"] = video_data
+
+        # Instant Experience (Canvas) is attached at creative via post_click_configuration
+        post_click_configuration = None
+        if instant_experience_id:
+            post_click_configuration = {"instant_experience_id": instant_experience_id}
+
+        # Partnership / Branded Content:
+        # NOTE: Partner 'ad code' (IG Partnership Ads) must be attached in the creative.
+        # Depending on the surface, this lives under sponsorship/branded-content specs.
+        sponsorship_blocks = {}
+        if partnership_ad_code:
+            # The API expects the ad code in the partnership/branded content spec.
+            # We forward it in a sponsorship spec; the exact key is handled by the API layer.
+            sponsorship_blocks["partnership_ad_code"] = partnership_ad_code  # forwarded (API layer should map)
+        if branded_content_sponsor_page_id:
+            sponsorship_blocks["branded_content_sponsor_page_id"] = branded_content_sponsor_page_id
+        if sponsor_ig_user_id:
+            sponsorship_blocks["sponsor_ig_user_id"] = sponsor_ig_user_id
+
+        # Build final creative from object_story_spec + optional sponsorship and post_click config
+        creative = {"object_story_spec": object_story_spec}
+        if sponsorship_blocks:
+            # Prefer link_data.sponsorship_info_spec when using link_data;
+            # fall back to top-level branded content spec as needed by API version.
+            if "link_data" in object_story_spec:
+                creative.setdefault("object_story_spec", {}) \
+                        .setdefault("link_data", {})["sponsorship_info_spec"] = sponsorship_blocks
+            else:
+                # For video_data/existing post, use branded content creative fields.
+                creative.update({"branded_content": sponsorship_blocks})
+
+        if post_click_configuration:
+            creative["post_click_configuration"] = post_click_configuration
+
+        # URL/UTM template at creative level (if caller prefers)
+        if template_url_spec and "object_story_spec" in creative:
+            creative["template_url_spec"] = template_url_spec
+
+        # Creative features: set Multi-advertiser enroll_status explicitly (default OPT_OUT)
+        features = {"contextual_multi_ads": {"enroll_status": multi_advertiser_enroll_status}}
+        if standard_enhancements_enroll_status:
+            features["standard_enhancements"] = {"enroll_status": standard_enhancements_enroll_status}
+        creative["creative_features_spec"] = features  # Modern field family
+
+        # Escape hatch: merge raw creative overrides last
+        if creative_overrides:
+            # Shallow merge only; callers can pass full subtrees if needed.
+            creative.update(creative_overrides)
+
     endpoint = f"{account_id}/ads"
     
     params = {
         "name": name,
         "adset_id": adset_id,
-        "creative": {"creative_id": creative_id},
-        "status": status
+        "status": status,
+        "creative": json.dumps(creative)
     }
     
     # Add bid amount if provided
@@ -143,12 +307,24 @@ async def create_ad(
     # Add tracking specs if provided
     if tracking_specs is not None:
         params["tracking_specs"] = json.dumps(tracking_specs) # Needs to be JSON encoded string
+
+    # Pass-through global degrees_of_freedom_spec if the account requires it
+    if degrees_of_freedom_spec:
+        params["degrees_of_freedom_spec"] = json.dumps(degrees_of_freedom_spec)
     
     try:
         data = await make_api_request(endpoint, access_token, params, method="POST")
         return json.dumps(data, indent=2)
     except Exception as e:
         error_msg = str(e)
+        # Helpful error special-cases
+        if "enroll_status" in error_msg.lower():
+            return json.dumps({
+                "error": "Creative features require explicit enroll_status (OPT_IN/OPT_OUT).",
+                "details": error_msg,
+                "hint": "Try setting standard_enhancements_enroll_status='OPT_OUT' and/or multi_advertiser_enroll_status='OPT_OUT'.",
+                "params_sent": params
+            }, indent=2)
         return json.dumps({
             "error": "Failed to create ad",
             "details": error_msg,
@@ -562,66 +738,83 @@ async def update_ad(
 @mcp_server.tool()
 @meta_api_tool
 async def upload_ad_image(
-    access_token: str = None,
-    account_id: str = None,
-    image_path: str = None,
-    name: str = None
+        access_token: str = None,
+        account_id: str = None,
+        image_path: str = None,
+        name: str = None,
+        ad_image_crops: Optional[Dict[str, List[List[int]]]] = None,
 ) -> str:
     """
     Upload an image to use in Meta Ads creatives.
-    
+
     Args:
         access_token: Meta API access token (optional - will use cached token if not provided)
         account_id: Meta Ads account ID (format: act_XXXXXXXXX)
         image_path: Path to the image file to upload
         name: Optional name for the image (default: filename)
-    
+        ad_image_crops (dict, optional): Optional crop map in the format:
+            {
+                "100x100": [[0, 0, 100, 100]],
+                "191x100": [[12, 0, 204, 100]]
+            }
+
     Returns:
         JSON response with image details including hash for creative creation
     """
     # Check required parameters
     if not account_id:
         return json.dumps({"error": "No account ID provided"}, indent=2)
-    
+
     if not image_path:
         return json.dumps({"error": "No image path provided"}, indent=2)
-    
+
     # Ensure account_id has the 'act_' prefix for API compatibility
     if not account_id.startswith("act_"):
         account_id = f"act_{account_id}"
-    
+
     # Check if image file exists
     if not os.path.exists(image_path):
         return json.dumps({"error": f"Image file not found: {image_path}"}, indent=2)
-    
+
     try:
         # Read image file
         with open(image_path, "rb") as img_file:
             image_bytes = img_file.read()
-        
+
         # Get image filename if name not provided
         if not name:
             name = os.path.basename(image_path)
-        
+
         # Prepare the API endpoint for uploading images
         endpoint = f"{account_id}/adimages"
-        
+
         # We need to convert the binary data to base64 for API upload
         import base64
         encoded_image = base64.b64encode(image_bytes).decode('utf-8')
-        
+
         # Prepare POST parameters
         params = {
             "bytes": encoded_image,
             "name": name
         }
-        
+
+        if ad_image_crops:
+            if not isinstance(ad_image_crops, dict):
+                return json.dumps({"error": "Invalid format: ad_image_crops must be a dictionary"}, indent=2)
+            try:
+                for key, val in ad_image_crops.items():
+                    if not isinstance(key, str) or not isinstance(val, list):
+                        raise ValueError
+                params["ad_image_crops"] = json.dumps(ad_image_crops)
+            except (TypeError, ValueError):
+                return json.dumps({"error": "Invalid ad_image_crops structure"}, indent=2)
+
         # Make API request to upload the image
         print(f"Uploading image to Facebook Ad Account {account_id}")
         data = await make_api_request(endpoint, access_token, params, method="POST")
-        
+
         return json.dumps(data, indent=2)
-    
+
     except Exception as e:
         return json.dumps({
             "error": "Failed to upload image",
@@ -631,7 +824,7 @@ async def upload_ad_image(
 
 @mcp_server.tool()
 @meta_api_tool
-async def create_ad_creative(
+async def create_ad_creative_basic(
     access_token: str = None,
     account_id: str = None,
     name: str = None,
@@ -1362,3 +1555,566 @@ async def get_account_pages(access_token: str = None, account_id: str = None) ->
             "error": "Failed to get account pages",
             "details": str(e)
         }, indent=2)
+
+@mcp_server.tool()
+@meta_api_tool
+async def upload_ad_video(
+    access_token: str,
+    account_id: str,
+    video_path: str,
+    name: Optional[str] = None,
+    description: Optional[str] = None
+) -> str:
+    """
+    Upload a video file to Meta Ads account for use in video creatives.
+
+    Args:
+        access_token (str): Meta API access token
+        account_id (str): Meta Ads account ID (format: act_XXXXXXXXX)
+        video_path (str): Path to local video file (MP4/MOV)
+        name (str, optional): Optional name for the video
+        description (str, optional): Optional video description
+
+    Returns:
+        JSON response with video_id and status
+    """
+    import aiohttp
+
+    if not os.path.exists(video_path):
+        return json.dumps({"error": f"Video file not found: {video_path}"}, indent=2)
+
+    if not account_id.startswith("act_"):
+        account_id = f"act_{account_id}"
+
+    url = f"https://graph-video.facebook.com/v18.0/{account_id}/advideos"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            with open(video_path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("source", f, filename=os.path.basename(video_path))
+                if name:
+                    data.add_field("name", name)
+                if description:
+                    data.add_field("description", description)
+                data.add_field("access_token", access_token)
+
+                async with session.post(url, data=data) as resp:
+                    resp_json = await resp.json()
+                    return json.dumps(resp_json, indent=2)
+    except Exception as e:
+        return json.dumps({"error": "Video upload failed", "details": str(e)}, indent=2)
+
+@mcp_server.tool()
+@meta_api_tool
+async def create_ad_creative_from_video(
+    access_token: str,
+    account_id: str,
+    page_id: str,
+    video_id: str,
+    name: Optional[str] = None,
+    message: Optional[str] = None,
+    call_to_action_type: Optional[str] = "LEARN_MORE",
+    link_url: Optional[str] = None,
+    image_hash: Optional[str] = None
+) -> str:
+    """
+    Create a video ad creative using a previously uploaded video.
+
+    Args:
+        access_token: Meta API token
+        account_id: Ad account ID (e.g., act_123...)
+        page_id: Facebook Page ID that sponsors the ad
+        video_id: ID returned from video upload
+        name: Optional creative name
+        message: Optional text to appear above the video
+        call_to_action_type: CTA type (e.g., LEARN_MORE, SHOP_NOW)
+        link_url: Destination URL for CTA
+        image_hash: Required thumbnail image hash for the video
+
+    Returns:
+        JSON response with creative_id and details
+    """
+    if not account_id.startswith("act_"):
+        account_id = f"act_{account_id}"
+
+    if not image_hash:
+        return json.dumps({
+            "error": "Missing image_hash. Meta Ads requires a video thumbnail for all video creatives."
+        }, indent=2)
+
+    endpoint = f"{account_id}/adcreatives"
+
+    payload = {
+        "name": name or "Video Creative",
+        "object_story_spec": {
+            "page_id": page_id,
+            "video_data": {
+                "video_id": video_id,
+                "message": message or "Check this out!",
+                "call_to_action": {
+                    "type": call_to_action_type,
+                    "value": {
+                        "link": link_url or "https://example.com"
+                    }
+                },
+                "image_hash": image_hash
+            }
+        }
+    }
+
+    result = await make_api_request(endpoint, access_token, payload, method="POST")
+    return json.dumps(result, indent=2)
+
+
+@mcp_server.tool()
+@meta_api_tool
+async def create_ad_from_creative(
+    access_token: str,
+    account_id: str,
+    adset_id: str,
+    creative_id: str,
+    name: Optional[str] = None,
+    status: Optional[str] = "PAUSED"
+) -> str:
+    """
+    Create an ad from an existing creative.
+
+    Args:
+        access_token: Meta API token
+        account_id: Ad account ID (e.g., act_123...)
+        adset_id: ID of the ad set to attach this ad to
+        creative_id: ID of the creative (e.g., from image or video)
+        name: Ad name
+        status: Ad status (PAUSED, ACTIVE, etc.)
+
+    Returns:
+        JSON response with ad_id and details
+    """
+    if not account_id.startswith("act_"):
+        account_id = f"act_{account_id}"
+
+    endpoint = f"{account_id}/ads"
+
+    payload = {
+        "name": name or "Ad from creative",
+        "adset_id": adset_id,
+        "creative": {"creative_id": creative_id},
+        "status": status
+    }
+
+    result = await make_api_request(endpoint, access_token, payload, method="POST")
+    return json.dumps(result, indent=2)
+
+@mcp_server.tool()
+@meta_api_tool
+async def create_ad_from_video_file(
+    access_token: str,
+    account_id: str,
+    adset_id: str,
+    page_id: str,
+    video_path: str,
+    ad_name: Optional[str] = None,
+    creative_name: Optional[str] = None,
+    message: Optional[str] = None,
+    call_to_action_type: Optional[str] = "LEARN_MORE",
+    link_url: Optional[str] = None,
+    status: Optional[str] = "PAUSED",
+    image_hash: Optional[str] = None
+) -> str:
+    """
+    Create a complete video ad (video upload → creative → ad) in one step.
+
+    Args:
+        access_token: Meta API token
+        account_id: Ad account ID (e.g., act_123...)
+        adset_id: Ad set ID to associate the ad
+        page_id: Facebook Page ID sponsoring the ad
+        video_path: Local path to video (MP4/MOV)
+        ad_name: Name for the ad (optional)
+        creative_name: Name for the creative (optional)
+        message: Text above the video (optional)
+        call_to_action_type: CTA type (e.g., LEARN_MORE, SHOP_NOW)
+        link_url: URL for the CTA
+        status: Initial status of the ad (PAUSED/ACTIVE)
+
+    Returns:
+        JSON response with ad_id, creative_id, and video_id
+    """
+    if not os.path.exists(video_path):
+        return json.dumps({"error": f"Video file not found: {video_path}"}, indent=2)
+
+    video_result = await upload_ad_video(
+        access_token=access_token,
+        account_id=account_id,
+        video_path=video_path,
+        name=creative_name,
+        description=message,
+    )
+
+    video_data = json.loads(video_result)
+    if "id" not in video_data:
+        return json.dumps({"error": "Video upload failed", "details": video_data}, indent=2)
+
+    video_id = video_data["id"]
+
+    creative_result = await create_ad_creative_from_video(
+        access_token=access_token,
+        account_id=account_id,
+        page_id=page_id,
+        video_id=video_id,
+        name=creative_name,
+        message=message,
+        call_to_action_type=call_to_action_type,
+        link_url=link_url,
+        image_hash=image_hash
+    )
+
+    creative_data = json.loads(creative_result)
+    if "id" not in creative_data:
+        return json.dumps({"error": "Creative creation failed", "details": creative_data}, indent=2)
+
+    creative_id = creative_data["id"]
+
+    ad_result = await create_ad_from_creative(
+        access_token=access_token,
+        account_id=account_id,
+        adset_id=adset_id,
+        creative_id=creative_id,
+        name=ad_name,
+        status=status,
+    )
+
+    ad_data = json.loads(ad_result)
+    if "id" not in ad_data:
+        return json.dumps({"error": "Ad creation failed", "details": ad_data}, indent=2)
+
+    return json.dumps({
+        "video_id": video_id,
+        "creative_id": creative_id,
+        "ad_id": ad_data["id"]
+    }, indent=2)
+
+@mcp_server.tool()
+@meta_api_tool
+async def upload_multiple_ad_images(
+    access_token: str,
+    account_id: str,
+    images: List[Dict[str, Optional[str]]],
+) -> str:
+    """
+    Upload multiple images to Meta Ads account using MCP.
+
+    Each image dict must contain:
+      - image_path: Local file path
+      - name: Optional image name
+      - ad_image_crops: Optional crop dictionary
+
+    Example input:
+    images=[
+      {
+        "image_path": "/tmp/img1.jpg",
+        "name": "creative1",
+        "ad_image_crops": {"1000x1000": [[0, 0, 1000, 1000]]}
+      },
+      {
+        "image_path": "/tmp/img2.jpg",
+        "name": "creative2"
+      }
+    ]
+
+    Returns:
+        JSON string with list of results per image
+    """
+
+    if not access_token or not account_id:
+        return json.dumps({"error": "Missing access_token or account_id"}, indent=2)
+
+    if not images:
+        return json.dumps({"error": "No images provided"}, indent=2)
+
+    if not account_id.startswith("act_"):
+        account_id = f"act_{account_id}"
+
+    results = []
+    for i, img in enumerate(images):
+        image_path = img.get("image_path")
+        name = img.get("name")
+        ad_image_crops = img.get("ad_image_crops")
+
+        if not image_path or not os.path.exists(image_path):
+            results.append({"index": i, "error": f"File not found: {image_path}"})
+            continue
+
+        result = await upload_ad_image(
+            access_token=access_token,
+            account_id=account_id,
+            image_path=image_path,
+            name=name,
+            ad_image_crops=ad_image_crops,
+        )
+
+        results.append(json.loads(result))
+
+    return json.dumps(results, indent=2)
+
+
+@mcp_server.tool()
+@meta_api_tool
+async def create_lookalike_audience(
+    account_id: str,
+    access_token: Optional[str] = None,
+    name: Optional[str] = None,
+    lookalike_spec: Optional[Dict[str, Any]] = None,
+    origin_audience_id: Optional[str] = None,
+    country: Optional[str] = None,    # ISO-2 (e.g., "BR", "US")
+    ratio: Optional[float] = None,    # e.g., 0.01 for 1%
+    description: Optional[str] = None,
+    is_private: Optional[bool] = None,
+    subtype: str = "LOOKALIKE"
+) -> str:
+    """
+    Create a Lookalike Audience on the Ad Account.
+
+    You can either:
+      - Provide a full 'lookalike_spec' (Option A), or
+      - Provide 'origin_audience_id' + 'country' + 'ratio' (Option B), and we assemble a minimal spec.
+
+    Notes:
+      - The Marketing API accepts several shapes for lookalike_spec. This tool keeps it flexible:
+        if you pass 'lookalike_spec' we forward it; else we build a simple similarity spec from the origin.
+      - 'ratio' is a float (e.g., 0.01 for 1%). If you omit it, the platform will pick defaults.
+
+    Args:
+        account_id: Ad Account in the form "act_<ID>".
+        access_token: Graph token.
+        name: Optional audience name (recommended).
+        lookalike_spec: Raw lookalike spec to forward to the API.
+        origin_audience_id: Custom Audience seed for Option B.
+        country: ISO-2 country for Option B.
+        ratio: Similarity ratio for Option B (e.g., 0.01).
+        description: Optional description.
+        is_private: Optional privacy flag.
+        subtype: Must be "LOOKALIKE".
+
+    Returns:
+        JSON with the created Custom Audience or a structured error.
+    """
+    if not account_id:
+        return json.dumps({"error": "account_id is required (e.g., 'act_123')" }, indent=2)
+    if not name:
+        return json.dumps({"error": "name is recommended to identify the lookalike"}, indent=2)
+    if not lookalike_spec:
+        if not origin_audience_id or not country:
+            return json.dumps({
+                "error": "Provide either a full lookalike_spec OR origin_audience_id + country",
+                "hint": "For a simple 1% LAL: origin_audience_id='<CA_ID>', country='BR', ratio=0.01"
+            }, indent=2)
+        lookalike_spec = {
+            # Keep keys minimal and forward-compatible; platform may extend/ignore specifics
+            "country": country,
+            "origin_audience_id": origin_audience_id
+        }
+        if ratio is not None:
+            lookalike_spec["ratio"] = float(ratio)
+
+    endpoint = f"{account_id}/customaudiences"
+    params: Dict[str, Any] = {
+        "name": name,
+        "subtype": subtype,
+        "lookalike_spec": json.dumps(lookalike_spec)
+    }
+    if description is not None:
+        params["description"] = description
+    if is_private is not None:
+        params["is_private"] = "true" if is_private else "false"
+
+    try:
+        data = await make_api_request(endpoint, access_token, params, method="POST")
+        return json.dumps(data, indent=2)
+    except Exception as e:
+        return json.dumps({"error": "Failed to create lookalike audience", "details": str(e), "params_sent": params}, indent=2)
+
+
+@mcp_server.tool()
+@meta_api_tool
+async def create_ad_creative(
+    account_id: str,
+    access_token: Optional[str] = None,
+    name: Optional[str] = None,
+    page_id: Optional[str] = None,
+    instagram_actor_id: Optional[str] = None,
+    format: str = "SINGLE_IMAGE",                     # SINGLE_IMAGE | SINGLE_VIDEO | CAROUSEL | EXISTING_POST
+    object_story_id: Optional[str] = None,            # for EXISTING_POST
+    message: Optional[str] = None,
+    headline: Optional[str] = None,
+    description: Optional[str] = None,
+    call_to_action_type: Optional[str] = None,        # e.g., LEARN_MORE, SHOP_NOW
+    link_url: Optional[str] = None,
+    template_url_spec: Optional[Dict[str, Any]] = None, # UTM builder
+    app_link_spec: Optional[Dict[str, Any]] = None,     # deep links
+    instant_experience_id: Optional[str] = None,        # Canvas
+    image_hash: Optional[str] = None,
+    video_id: Optional[str] = None,
+    carousel_attachments: Optional[List[Dict[str, Any]]] = None,  # [{link, image_hash|video_id, name?, description?}, ...]
+    additional_image_variants: Optional[List[Dict[str, Any]]] = None,
+    sponsorship_info_spec: Optional[Dict[str, Any]] = None,       # e.g., {"partnership_ad_code": "...", ...}
+    creative_overrides: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Pre-create an Ad Creative. This is useful when you want to:
+      - Build creatives ahead of time and reference them via creative_id in `create_ad`.
+      - Generate additional variants (square/landscape) for the same asset, returning multiple creative IDs.
+
+    Behavior:
+      - If format == EXISTING_POST: requires object_story_id (boost).
+      - SINGLE_IMAGE: requires image_hash and link_url (for link ads).
+      - SINGLE_VIDEO: requires video_id; link_url optional (CTA may carry the link).
+      - CAROUSEL: requires >= 2 attachments with link + media.
+      - Instant Experience is attached via post_click_configuration.instant_experience_id.
+      - If additional_image_variants is provided, we will create extra creatives for each image variant
+        (e.g., square/landscape), returning a list of created creative IDs.
+
+    Returns:
+        JSON:
+        {
+          "primary_creative": {"id":"..."},
+          "variant_creatives": [{"id":"..."}, ...]   # only when additional_image_variants provided
+        }
+    """
+    if not account_id:
+        return json.dumps({"error":"account_id is required (act_<ID>)"}, indent=2)
+
+    # Build base creative payload
+    creative: Dict[str, Any] = {}
+    if format == "EXISTING_POST":
+        if not object_story_id:
+            return json.dumps({"error":"object_story_id is required for EXISTING_POST"}, indent=2)
+        creative["object_story_id"] = object_story_id
+    else:
+        if not (page_id or instagram_actor_id):
+            return json.dumps({"error":"Provide page_id and/or instagram_actor_id for inline creative identity"}, indent=2)
+
+        object_story_spec: Dict[str, Any] = {}
+        if page_id: object_story_spec["page_id"] = page_id
+        if instagram_actor_id: object_story_spec["instagram_actor_id"] = instagram_actor_id
+
+        if format in ("SINGLE_IMAGE", "CAROUSEL"):
+            if not link_url:
+                return json.dumps({"error":"link_url is required for image/carousel link creatives"}, indent=2)
+            link_data: Dict[str, Any] = {"link": link_url}
+            if message: link_data["message"] = message
+            if headline: link_data["name"] = headline
+            if description: link_data["description"] = description
+            if call_to_action_type:
+                link_data["call_to_action"] = {"type": call_to_action_type, "value": {"link": link_url}}
+            if template_url_spec:
+                link_data["template_url_spec"] = template_url_spec
+            if app_link_spec:
+                link_data["app_link_spec"] = app_link_spec
+
+            if format == "SINGLE_IMAGE":
+                if not image_hash:
+                    return json.dumps({"error":"image_hash is required for SINGLE_IMAGE"}, indent=2)
+                link_data["image_hash"] = image_hash
+
+            if format == "CAROUSEL":
+                if not carousel_attachments or len(carousel_attachments) < 2:
+                    return json.dumps({"error":"carousel_attachments must have at least 2 items"}, indent=2)
+                children = []
+                for idx, att in enumerate(carousel_attachments, start=1):
+                    if "link" not in att:
+                        return json.dumps({"error": f"carousel_attachments[{idx}] needs 'link'"}, indent=2)
+                    if not any(k in att for k in ("image_hash","video_id")):
+                        return json.dumps({"error": f"carousel_attachments[{idx}] needs 'image_hash' or 'video_id'"}, indent=2)
+                    child = {"link": att["link"]}
+                    if "image_hash" in att: child["image_hash"] = att["image_hash"]
+                    if "video_id" in att: child["video_id"] = att["video_id"]
+                    if "name" in att: child["name"] = att["name"]
+                    if "description" in att: child["description"] = att["description"]
+                    if call_to_action_type:
+                        child["call_to_action"] = {"type": call_to_action_type, "value": {"link": att["link"]}}
+                    children.append(child)
+                link_data["child_attachments"] = children
+
+            object_story_spec["link_data"] = link_data
+
+        if format == "SINGLE_VIDEO":
+            if not video_id:
+                return json.dumps({"error":"video_id is required for SINGLE_VIDEO"}, indent=2)
+            video_data: Dict[str, Any] = {"video_id": video_id}
+            if message: video_data["message"] = message
+            if call_to_action_type and link_url:
+                video_data["call_to_action"] = {"type": call_to_action_type, "value": {"link": link_url}}
+            if link_url:
+                video_data["link_description"] = description or ""
+            object_story_spec["video_data"] = video_data
+
+        # Instant Experience
+        if instant_experience_id:
+            creative["post_click_configuration"] = {"instant_experience_id": instant_experience_id}
+
+        # Sponsorship / branded content
+        if sponsorship_info_spec:
+            if "link_data" in object_story_spec:
+                object_story_spec.setdefault("link_data", {})["sponsorship_info_spec"] = sponsorship_info_spec
+            else:
+                creative["branded_content"] = sponsorship_info_spec
+
+        creative["object_story_spec"] = object_story_spec
+
+    if name:
+        creative["name"] = name
+
+    # Apply overrides last
+    if creative_overrides:
+        creative.update(creative_overrides)
+
+    # Create primary creative
+    endpoint = f"{account_id}/adcreatives"
+    try:
+        primary = await make_api_request(endpoint, access_token, {"object_story_spec": json.dumps(creative.get("object_story_spec", {})),
+                                                                  **({ "name": name } if name else {}),
+                                                                  **({ "post_click_configuration": json.dumps(creative["post_click_configuration"]) } if "post_click_configuration" in creative else {}),
+                                                                  **({ "branded_content": json.dumps(creative["branded_content"]) } if "branded_content" in creative else {}),
+                                                                  **({k: v for k, v in creative.items() if k not in ("object_story_spec","post_click_configuration","branded_content","name")} )}, method="POST")
+    except Exception as e:
+        return json.dumps({"error":"Failed to create primary creative","details": str(e)}, indent=2)
+
+    # Optionally create variant creatives (e.g., square/landscape alternatives)
+    variants: List[Dict[str, Any]] = []
+    if additional_image_variants and format == "SINGLE_IMAGE":
+        for var in additional_image_variants:
+            # var: {"image_hash": "...", "name_suffix": "[Square]"} (link_url/headline/cta reused)
+            alt_hash = var.get("image_hash")
+            if not alt_hash:
+                variants.append({"error": "variant missing image_hash"})
+                continue
+            alt_name = f"{name} {var.get('name_suffix','[Variant]')}" if name else None
+            alt_spec = json.loads(json.dumps(creative))  # deep copy
+            # Replace the image in link_data
+            try:
+                alt_spec["object_story_spec"]["link_data"]["image_hash"] = alt_hash
+            except Exception:
+                variants.append({"error":"could not rewrite variant link_data"})
+                continue
+
+            try:
+                payload = {
+                    "object_story_spec": json.dumps(alt_spec["object_story_spec"]),
+                }
+                if alt_name:
+                    payload["name"] = alt_name
+                if "post_click_configuration" in alt_spec:
+                    payload["post_click_configuration"] = json.dumps(alt_spec["post_click_configuration"])
+                if "branded_content" in alt_spec:
+                    payload["branded_content"] = json.dumps(alt_spec["branded_content"])
+                v = await make_api_request(endpoint, access_token, payload, method="POST")
+                variants.append(v)
+            except Exception as e:
+                variants.append({"error":"Failed to create variant creative","details": str(e)})
+
+    return json.dumps({
+        "primary_creative": primary,
+        **({"variant_creatives": variants} if variants else {})
+    }, indent=2)
